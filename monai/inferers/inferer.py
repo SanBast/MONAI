@@ -962,6 +962,7 @@ class DiffusionInferer(Inferer):
         condition: torch.Tensor | None = None,
         mode: str = "crossattn",
         seg: torch.Tensor | None = None,
+        concat_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Implements the forward pass for a supervised training iteration.
@@ -975,17 +976,25 @@ class DiffusionInferer(Inferer):
             mode: Conditioning mode for the network.
             seg: if model is instance of SPADEDiffusionModelUnet, segmentation must be
             provided on the forward (for SPADE-like AE or SPADE-like DM)
+            concat_condition: Further conditioning for network input.
+            Used when one wants to use "crossattn" for the main condition and "concat" for the extra condition.
         """
         if mode not in ["crossattn", "concat"]:
             raise NotImplementedError(f"{mode} condition is not supported")
+        if mode == "concat" and concat_condition is not None:
+            raise ValueError(
+                "concat_condition cannot be used with mode='concat'. Use mode='crossattn' to pass "
+                "condition as cross-attention context and concat_condition as extra input channels."
+            )
 
         noisy_image: torch.Tensor = self.scheduler.add_noise(original_samples=inputs, noise=noise, timesteps=timesteps)
         if mode == "concat":
             if condition is None:
                 raise ValueError("Conditioning is required for concat condition")
-            else:
-                noisy_image = torch.cat([noisy_image, condition], dim=1)
-                condition = None
+            noisy_image = torch.cat([noisy_image, condition], dim=1)
+            condition = None
+        if concat_condition is not None:
+            noisy_image = torch.cat([noisy_image, concat_condition], dim=1)
         diffusion_model = (
             partial(diffusion_model, seg=seg)
             if isinstance(diffusion_model, SPADEDiffusionModelUNet)
