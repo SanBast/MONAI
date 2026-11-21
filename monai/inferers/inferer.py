@@ -1018,6 +1018,7 @@ class DiffusionInferer(Inferer):
         seg: torch.Tensor | None = None,
         cfg: float | None = None,
         cfg_fill_value: float = -1.0,
+        concat_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -1032,11 +1033,17 @@ class DiffusionInferer(Inferer):
             seg: if diffusion model is instance of SPADEDiffusionModel, segmentation must be provided.
             cfg: classifier-free-guidance scale, which indicates the level of strengthening on the conditioning.
             cfg_fill_value: the fill value to use for the unconditioned input when using classifier-free guidance.
+            concat_conditioning: Further conditioning for network input. Batch is duplicated for CFG with no fill value.
         """
         if mode not in ["crossattn", "concat"]:
             raise NotImplementedError(f"{mode} condition is not supported")
         if mode == "concat" and conditioning is None:
             raise ValueError("Conditioning must be supplied for if condition mode is concat.")
+        if mode == "concat" and concat_conditioning is not None:
+            raise ValueError(
+                "The extra concat_conditioning cannot be used with mode='concat'. Use mode='crossattn' to pass "
+                "conditioning as cross-attention context and concat_conditioning as extra input channels."
+            )
         if not scheduler:
             scheduler = self.scheduler
         image = input_noise
@@ -1055,6 +1062,11 @@ class DiffusionInferer(Inferer):
         else:
             progress_bar = iter(zip(scheduler.timesteps, all_next_timesteps))
         intermediates = []
+
+        if cfg is not None and concat_conditioning is not None:
+            # CFG doubles the batch (unconditioned + conditioned halves). The spatial condition is
+            # the same in both halves: guidance applies to the cross-attention conditioning only.
+            concat_conditioning = torch.cat([concat_conditioning] * 2, dim=0)
 
         for t, next_t in progress_bar:
             # 1. predict noise model_output
@@ -1076,6 +1088,8 @@ class DiffusionInferer(Inferer):
             else:
                 model_input = image
                 conditioning_input = conditioning
+            if concat_conditioning is not None:
+                model_input = torch.cat([model_input, concat_conditioning], dim=1)
             if mode == "concat" and conditioning_input is not None:
                 model_input = torch.cat([model_input, conditioning_input], dim=1)
                 model_output = diffusion_model(
@@ -1114,6 +1128,7 @@ class DiffusionInferer(Inferer):
         scaled_input_range: tuple = (0, 1),
         verbose: bool = True,
         seg: torch.Tensor | None = None,
+        concat_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Computes the log-likelihoods for an input.
@@ -1129,6 +1144,9 @@ class DiffusionInferer(Inferer):
             scaled_input_range: the [min,max] intensity range of the input data after scaling.
             verbose: if true, prints the progression bar of the sampling process.
             seg: if diffusion model is instance of SPADEDiffusionModel, segmentation must be provided.
+            concat_conditioning: extra conditioning concatenated to the noisy input along the channel
+                dimension, used together with mode="crossattn". The diffusion model's ``in_channels``
+                must include these channels.
         """
 
         if not scheduler:
@@ -1142,6 +1160,11 @@ class DiffusionInferer(Inferer):
             raise NotImplementedError(f"{mode} condition is not supported")
         if mode == "concat" and conditioning is None:
             raise ValueError("Conditioning must be supplied for if condition mode is concat.")
+        if mode == "concat" and concat_conditioning is not None:
+            raise ValueError(
+                "The extra concat_conditioning cannot be used with mode='concat'. Use mode='crossattn' to pass "
+                "conditioning as cross-attention context and concat_conditioning as extra input channels."
+            )
         if verbose and has_tqdm:
             progress_bar = tqdm(scheduler.timesteps)
         else:
@@ -1157,11 +1180,15 @@ class DiffusionInferer(Inferer):
                 if isinstance(diffusion_model, SPADEDiffusionModelUNet)
                 else diffusion_model
             )
+            # keep noisy_image with the image channels only: the posterior math below uses it as x_t
+            model_input = noisy_image
+            if concat_conditioning is not None:
+                model_input = torch.cat([model_input, concat_conditioning], dim=1)
             if mode == "concat" and conditioning is not None:
                 noisy_image = torch.cat([noisy_image, conditioning], dim=1)
                 model_output = diffusion_model(noisy_image, timesteps=timesteps, context=None)
             else:
-                model_output = diffusion_model(x=noisy_image, timesteps=timesteps, context=conditioning)
+                model_output = diffusion_model(x=model_input, timesteps=timesteps, context=conditioning)
 
             # get the model's predicted mean,  and variance if it is predicted
             variance_type = self._get_scheduler_config_value(scheduler, "variance_type")

@@ -56,6 +56,21 @@ TEST_CASES = [
 ]
 
 
+class _ConcatInsideModel(torch.nn.Module):
+    """Reference model: concatenates a fixed spatial condition to its input inside ``forward``."""
+
+    def __init__(self, model: torch.nn.Module, concat_conditioning: torch.Tensor) -> None:
+        super().__init__()
+        self.model = model
+        self.concat_conditioning = concat_conditioning
+
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        # classifier-free guidance doubles the batch of x, so repeat the condition to match it
+        repeats = x.shape[0] // self.concat_conditioning.shape[0]
+        concat_conditioning = torch.cat([self.concat_conditioning] * repeats, dim=0)
+        return self.model(torch.cat([x, concat_conditioning], dim=1), timesteps=timesteps, context=context)
+
+
 class TestDiffusionSamplingInferer(unittest.TestCase):
     @parameterized.expand(TEST_CASES)
     @skipUnless(has_einops, "Requires einops")
@@ -326,6 +341,39 @@ class TestDiffusionSamplingInferer(unittest.TestCase):
 
     @parameterized.expand(TEST_CASES)
     @skipUnless(has_einops, "Requires einops")
+    def test_sampler_conditioned_with_concat_condition(self, model_params, input_shape):
+        # copy the model_params dict to prevent from modifying test cases
+        model_params = model_params.copy()
+        n_concat_channel = 2
+        model_params["in_channels"] = model_params["in_channels"] + n_concat_channel
+        model_params["cross_attention_dim"] = 8
+        model_params["with_conditioning"] = True
+        model = DiffusionModelUNet(**model_params)
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+        noise = torch.randn(input_shape).to(device)
+        concat_conditioning_shape = list(input_shape)
+        concat_conditioning_shape[1] = n_concat_channel
+        concat_conditioning = torch.randn(concat_conditioning_shape).to(device)
+        conditioning = torch.randn([input_shape[0], 1, model_params["cross_attention_dim"]]).to(device)
+        scheduler = DDPMScheduler(num_train_timesteps=10)
+        inferer = DiffusionInferer(scheduler=scheduler)
+        scheduler.set_timesteps(num_inference_steps=10)
+        sample, intermediates = inferer.sample(
+            input_noise=noise,
+            diffusion_model=model,
+            scheduler=scheduler,
+            save_intermediates=True,
+            intermediate_steps=1,
+            conditioning=conditioning,
+            mode="crossattn",
+            concat_conditioning=concat_conditioning,
+        )
+        self.assertEqual(len(intermediates), 10)
+
+    @parameterized.expand(TEST_CASES)
+    @skipUnless(has_einops, "Requires einops")
     def test_sampler_conditioned_concat_cfg(self, model_params, input_shape):
         # copy the model_params dict to prevent from modifying test cases
         model_params = model_params.copy()
@@ -512,6 +560,68 @@ class TestDiffusionSamplingInferer(unittest.TestCase):
                 mode="concat",
                 condition=conditioning,
                 concat_condition=concat_conditioning,
+            )
+
+    @parameterized.expand(TEST_CASES)
+    @skipUnless(has_einops, "Requires einops")
+    def test_get_likelihood_with_concat_conditioning(self, model_params, input_shape):
+        # copy the model_params dict to prevent from modifying test cases
+        model_params = model_params.copy()
+        n_concat_channel = 2
+        model_params["in_channels"] = model_params["in_channels"] + n_concat_channel
+        model_params["cross_attention_dim"] = 8
+        model_params["with_conditioning"] = True
+        model = DiffusionModelUNet(**model_params)
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+        input = torch.randn(input_shape).to(device)
+        concat_conditioning_shape = list(input_shape)
+        concat_conditioning_shape[1] = n_concat_channel
+        concat_conditioning = torch.randn(concat_conditioning_shape).to(device)
+        conditioning = torch.randn([input_shape[0], 1, model_params["cross_attention_dim"]]).to(device)
+        scheduler = DDPMScheduler(num_train_timesteps=10)
+        inferer = DiffusionInferer(scheduler=scheduler)
+        scheduler.set_timesteps(num_inference_steps=10)
+        # get_likelihood draws random noise, so both calls use the same seed
+        torch.manual_seed(0)
+        likelihood, intermediates = inferer.get_likelihood(
+            inputs=input,
+            diffusion_model=model,
+            scheduler=scheduler,
+            save_intermediates=True,
+            conditioning=conditioning,
+            mode="crossattn",
+            concat_conditioning=concat_conditioning,
+        )
+        self.assertEqual(intermediates[0].shape, input.shape)
+        self.assertEqual(likelihood.shape[0], input.shape[0])
+        # the result must match a model that concatenates the condition itself
+        torch.manual_seed(0)
+        expected = inferer.get_likelihood(
+            inputs=input,
+            diffusion_model=_ConcatInsideModel(model, concat_conditioning),
+            scheduler=scheduler,
+            conditioning=conditioning,
+            mode="crossattn",
+        )
+        torch.testing.assert_close(likelihood, expected)
+
+    @skipUnless(has_einops, "Requires einops")
+    def test_get_likelihood_incompatible_concat_conditioning_with_concat_mode(self):
+        model_params, input_shape = TEST_CASES[0]
+        model = DiffusionModelUNet(**model_params)
+        input = torch.randn(input_shape)
+        conditioning = torch.randn(input_shape)
+        scheduler = DDPMScheduler(num_train_timesteps=10)
+        inferer = DiffusionInferer(scheduler=scheduler)
+        with self.assertRaisesRegex(ValueError, "concat_conditioning cannot be used with mode='concat'"):
+            inferer.get_likelihood(
+                inputs=input,
+                diffusion_model=model,
+                conditioning=conditioning,
+                mode="concat",
+                concat_conditioning=conditioning,
             )
 
 
