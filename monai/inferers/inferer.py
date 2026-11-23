@@ -1357,6 +1357,7 @@ class LatentDiffusionInferer(DiffusionInferer):
         condition: torch.Tensor | None = None,
         mode: str = "crossattn",
         seg: torch.Tensor | None = None,
+        concat_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Implements the forward pass for a supervised training iteration.
@@ -1370,12 +1371,18 @@ class LatentDiffusionInferer(DiffusionInferer):
             condition: conditioning for network input.
             mode: Conditioning mode for the network.
             seg: if diffusion model is instance of SPADEDiffusionModel, segmentation must be provided.
+            concat_condition: extra conditioning concatenated to the noisy latent along the channel dimension,
+                used together with mode="crossattn". It must have the spatial shape of the autoencoder latent.
+                If ``ldm_latent_shape`` is set, it is padded like the latent. The diffusion model's
+                ``in_channels`` must include these channels.
         """
         with torch.no_grad():
             latent = autoencoder_model.encode_stage_2_inputs(inputs) * self.scale_factor
 
         if self.ldm_latent_shape is not None:
             latent = torch.stack([self.ldm_resizer(i) for i in decollate_batch(latent)], 0)
+            if concat_condition is not None:
+                concat_condition = torch.stack([self.ldm_resizer(i) for i in decollate_batch(concat_condition)], 0)
 
         prediction: torch.Tensor = super().__call__(
             inputs=latent,
@@ -1385,6 +1392,7 @@ class LatentDiffusionInferer(DiffusionInferer):
             condition=condition,
             mode=mode,
             seg=seg,
+            concat_condition=concat_condition,
         )
         return prediction
 
@@ -1403,6 +1411,7 @@ class LatentDiffusionInferer(DiffusionInferer):
         seg: torch.Tensor | None = None,
         cfg: float | None = None,
         cfg_fill_value: float = -1.0,
+        concat_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -1419,6 +1428,10 @@ class LatentDiffusionInferer(DiffusionInferer):
              is instance of SPADEAutoencoderKL, segmentation must be provided.
             cfg: classifier-free-guidance scale, which indicates the level of strengthening on the conditioning.
             cfg_fill_value: the fill value to use for the unconditioned input when using classifier-free guidance.
+            concat_conditioning: extra conditioning concatenated to the noisy latent along the channel dimension,
+                used together with mode="crossattn". It must have the spatial shape of the autoencoder latent.
+                If ``ldm_latent_shape`` is set, it is padded like the latent. The diffusion model's
+                ``in_channels`` must include these channels.
         """
 
         if (
@@ -1432,6 +1445,12 @@ class LatentDiffusionInferer(DiffusionInferer):
                 f"{diffusion_model.label_nc}"
             )
 
+        if concat_conditioning is not None and self.ldm_latent_shape is not None:
+            concat_conditioning = torch.stack([self.ldm_resizer(i) for i in decollate_batch(concat_conditioning)], 0)
+            # SpatialPad returns a MetaTensor: the sampling loop needs a plain tensor
+            if isinstance(concat_conditioning, MetaTensor):
+                concat_conditioning = concat_conditioning.as_tensor()
+
         outputs = super().sample(
             input_noise=input_noise,
             diffusion_model=diffusion_model,
@@ -1444,6 +1463,7 @@ class LatentDiffusionInferer(DiffusionInferer):
             seg=seg,
             cfg=cfg,
             cfg_fill_value=cfg_fill_value,
+            concat_conditioning=concat_conditioning,
         )
 
         if save_intermediates:
@@ -1491,6 +1511,7 @@ class LatentDiffusionInferer(DiffusionInferer):
         resample_latent_likelihoods: bool = False,
         resample_interpolation_mode: str = "nearest",
         seg: torch.Tensor | None = None,
+        concat_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Computes the log-likelihoods of the latent representations of the input.
@@ -1512,6 +1533,10 @@ class LatentDiffusionInferer(DiffusionInferer):
                 or 'trilinear;
             seg: if diffusion model is instance of SPADEDiffusionModel, or autoencoder_model
              is instance of SPADEAutoencoderKL, segmentation must be provided.
+            concat_conditioning: extra conditioning concatenated to the noisy latent along the channel dimension,
+                used together with mode="crossattn". It must have the spatial shape of the autoencoder latent.
+                If ``ldm_latent_shape`` is set, it is padded like the latent. The diffusion model's
+                ``in_channels`` must include these channels.
         """
         if resample_latent_likelihoods and resample_interpolation_mode not in ("nearest", "bilinear", "trilinear"):
             raise ValueError(
@@ -1521,6 +1546,10 @@ class LatentDiffusionInferer(DiffusionInferer):
 
         if self.ldm_latent_shape is not None:
             latents = torch.stack([self.ldm_resizer(i) for i in decollate_batch(latents)], 0)
+            if concat_conditioning is not None:
+                concat_conditioning = torch.stack(
+                    [self.ldm_resizer(i) for i in decollate_batch(concat_conditioning)], 0
+                )
 
         outputs = super().get_likelihood(
             inputs=latents,
@@ -1531,6 +1560,7 @@ class LatentDiffusionInferer(DiffusionInferer):
             mode=mode,
             verbose=verbose,
             seg=seg,
+            concat_conditioning=concat_conditioning,
         )
 
         if save_intermediates and resample_latent_likelihoods:
